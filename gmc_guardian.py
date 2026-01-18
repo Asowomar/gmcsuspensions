@@ -3,7 +3,6 @@ from bs4 import BeautifulSoup
 import json
 import os
 import hashlib
-import time
 
 class GMCGuardian:
     def __init__(self, db_file="gmc_baseline.json"):
@@ -24,59 +23,67 @@ class GMCGuardian:
         return hashlib.md5(html_content.encode('utf-16')).hexdigest()
 
     def audit_site(self, url):
-        print(f"\n--- Monitoring: {url} ---")
+        print(f"\n--- GMC Guardian Audit: {url} ---")
         try:
-            headers = {'User-Agent': 'GMC-Guardian-Monitor/2.0'}
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
             res = requests.get(url, headers=headers, timeout=15)
             soup = BeautifulSoup(res.text, 'html.parser')
             text = res.text.lower()
             
-            current_data = {
+            findings = []
+            score = 100
+
+            # 1. Legal Pages Check (Multi-language support)
+            required_policies = {
+                'impressum': ['impressum', 'legal notice'],
+                'shipping': ['versand', 'shipping', 'delivery'],
+                'return': ['rückgabe', 'widerruf', 'return', 'refund'],
+                'privacy': ['datenschutz', 'privacy'],
+                'terms': ['agb', 'terms', 'conditions']
+            }
+            
+            found_policies = []
+            for key, keywords in required_policies.items():
+                if any(k in text for k in keywords):
+                    found_policies.append(key)
+                else:
+                    findings.append(f"MISSING: {key.capitalize()} policy not detected.")
+                    score -= 15
+
+            # 2. Contact Info Check
+            has_email = "@" in text
+            has_phone = any(char.isdigit() for char in text) # Basic check
+            if not has_email: 
+                findings.append("MISSING: Contact email not found.")
+                score -= 10
+            if not has_phone:
+                findings.append("MISSING: Phone number not found.")
+                score -= 10
+
+            # 3. Technical Check (Shopify/Schema)
+            is_shopify = "cdn.shopify.com" in text
+            has_schema = '"@type": "product"' in text or '"@type":"product"' in text
+            
+            if not has_schema:
+                findings.append("WARNING: No Product Schema (JSON-LD) detected on this page.")
+                score -= 10
+
+            report = {
                 "url": url,
-                "hash": self.get_page_hash(res.text),
-                "legal_pages": [p for p in ['refund', 'shipping', 'privacy', 'terms'] if p in text],
-                "contact_info": {
-                    "email": "@" in text,
-                    "phone": any(char.isdigit() for char in text)
-                },
-                "price_elements": [tag.get_text().strip() for tag in soup.find_all(class_=lambda x: x and 'price' in x.lower())][:5]
+                "score": max(0, score),
+                "is_shopify": is_shopify,
+                "found_policies": found_policies,
+                "findings": findings,
+                "status": "Healthy" if score > 85 else "At Risk"
             }
 
-            if url in self.baseline:
-                old_data = self.baseline[url]
-                alerts = []
-                
-                # 1. Check for missing legal pages
-                for p in old_data['legal_pages']:
-                    if p not in current_data['legal_pages']:
-                        alerts.append(f"CRITICAL RISK: Legal page '{p}' is missing or unreachable!")
-                
-                # 2. Check for price changes
-                if old_data['price_elements'] != current_data['price_elements']:
-                    alerts.append("WARNING: Prices on the page have changed. Update your GMC Feed immediately to avoid suspension!")
+            print(json.dumps(report, indent=2))
+            return report
 
-                # 3. Check for contact info removal
-                if old_data['contact_info']['email'] and not current_data['contact_info']['email']:
-                    alerts.append("RISK: Email address removed from site. This triggers 'Misrepresentation' flags.")
-
-                if alerts:
-                    print("🚨 ALERTS DETECTED:")
-                    for a in alerts: print(f" - {a}")
-                else:
-                    print("✅ No critical changes detected. System Healthy.")
-            else:
-                print("ℹ️ Initial scan completed. Baseline saved for future monitoring.")
-            
-            self.baseline[url] = current_data
-            self.save_baseline()
-            
         except Exception as e:
-            print(f"Error during scan: {e}")
+            print(f"Error during audit: {e}")
+            return None
 
 if __name__ == "__main__":
     guardian = GMCGuardian()
-    # Replace with the client's URL
-    target_url = "https://www.example.com"
-    
-    # Run once for demonstration. In production, wrap this in a loop or cron job.
-    guardian.audit_site(target_url)
+    guardian.audit_site("https://mialea.de")
