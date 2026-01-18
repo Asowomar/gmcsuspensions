@@ -1,0 +1,58 @@
+
+<!DOCTYPE html>
+<html lang='en'>
+<head>
+    <meta charset='UTF-8'>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; line-height: 1.6; color: #333; max-width: 800px; margin: 20px auto; padding: 20px; border: 1px solid #ddd; border-radius: 8px; }
+        .header { text-align: center; border-bottom: 2px solid #0052cc; padding-bottom: 10px; }
+        .score-box { background: #f8f9fa; padding: 20px; text-align: center; border-radius: 10px; margin: 20px 0; border: 1px solid #e9ecef; }
+        .score { font-size: 48px; font-weight: bold; color: #d35400; }
+        .risk-high { color: #c0392b; font-weight: bold; text-transform: uppercase; }
+        .risk-low { color: #27ae60; font-weight: bold; }
+        .check-item { margin-bottom: 15px; padding: 15px; border-left: 5px solid #ddd; border-radius: 0 5px 5px 0; }
+        .fail { border-left-color: #c0392b; background: #fff5f5; }
+        .pass { border-left-color: #27ae60; background: #f5fff8; }
+        .footer { font-size: 12px; text-align: center; margin-top: 30px; color: #777; border-top: 1px solid #eee; padding-top: 10px; }
+    </style>
+</head>
+<body>
+    <div class='header'>
+        <h1>GMC Guardian Audit Report</h1>
+        <p>Generated for: <strong>FashionStore-Global.com</strong></p>
+        <p>Date: 2026-01-18</p>
+    </div>
+
+    <div class='score-box'>
+        <p>Your GMC Health Score</p>
+        <div class='score'>65/100</div>
+        <p class='risk-high'>STATUS: AT RISK (Suspension Imminent)</p>
+    </div>
+
+    <h3>Detected Critical Issues:</h3>
+
+    <div class='check-item fail'>
+        <strong>❌ Price Mismatch Detected</strong><br>
+        The price displayed on the product page ($49.99) does not match the structured data in the source code ($54.99). This is the #1 trigger for 'Misrepresentation' suspensions.
+    </div>
+
+    <div class='check-item fail'>
+        <strong>❌ Missing Legal Compliance</strong><br>
+        No 'Shipping Policy' found in the footer. Google requires clear delivery times and costs to be accessible before the checkout process.
+    </div>
+
+    <div class='check-item pass'>
+        <strong>✅ Contact Transparency</strong><br>
+        Verified: Email address and phone number are clearly visible on the 'Contact Us' page.
+    </div>
+
+    <div class='check-item pass'>
+        <strong>✅ Secure Checkout (SSL)</strong><br>
+        The website is properly secured via HTTPS.
+    </div>
+
+    <div class='footer'>
+        &copy; 2026 GMC Suspensions - Powered by GMC Guardian Monitoring Engine
+    </div>
+</body>
+</html>
