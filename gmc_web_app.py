@@ -4,175 +4,127 @@ import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 import json
+import datetime
 
 app = Flask(__name__)
 CORS(app)
 
+# --- CONFIGURATIE ---
+# Voor Google Sheets integratie via gspread (vereist service_account.json)
+# Of gebruik een Webhook (n8n/Zapier) voor makkelijkere logging
+WEBHOOK_URL = "" # Vul hier een n8n of Zapier webhook in voor automatische sheets logging
+
 class GMCScanner:
     def __init__(self, base_url):
-        # Bugfix: Ensure URL has a scheme
         if not base_url.startswith(('http://', 'https://')):
             base_url = 'https://' + base_url
         self.base_url = base_url.strip('/')
         self.domain = urlparse(self.base_url).netloc
-        self.headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
+        self.headers = {'User-Agent': 'Mozilla/5.0 (GMC-Audit-Bot/3.0)'}
 
     def get_links(self, html, limit=3):
         soup = BeautifulSoup(html, 'html.parser')
         links = set()
-        # Bugfix: Better product link detection for Shopify and general stores
         for a in soup.find_all('a', href=True):
             url = urljoin(self.base_url, a['href'])
-            parsed = urlparse(url)
-            if self.domain in parsed.netloc and ('/products/' in url or '/product/' in url):
+            if self.domain in urlparse(url).netloc and ('/products/' in url or '/product/' in url):
                 links.add(url)
             if len(links) >= limit: break
         return list(links)
 
     def audit_page(self, url, is_main=False):
         try:
-            res = requests.get(url, headers=self.headers, timeout=10, allow_redirects=True)
-            soup = BeautifulSoup(res.text, 'html.parser')
+            res = requests.get(url, headers=self.headers, timeout=10)
             text = res.text.lower()
-            
             issues = []
-            # 1. Policy Checks (Main Page Only)
-            if is_main:
-                policies = {
-                    'Refund': ['refund', 'rückgabe', 'widerruf'],
-                    'Shipping': ['shipping', 'versand', 'lieferung'],
-                    'Privacy': ['privacy', 'datenschutz'],
-                    'Terms': ['terms', 'agb', 'conditions'],
-                    'Impressum': ['impressum', 'legal notice']
-                }
-                for p, keywords in policies.items():
-                    if not any(k in text for k in keywords):
-                        issues.append(f"Missing {p} policy link or mention.")
-                
-                if '@' not in text: issues.append("No contact email found on homepage.")
             
-            # 2. Technical Checks (Product Pages)
-            if not is_main or '/products/' in url:
-                has_schema = any(s in text for s in ['"@type":"product"', '"@type": "product"', 'schema.org/product'])
-                if not has_schema:
-                    issues.append("Missing Product Schema (JSON-LD) - Critical for GMC.")
-                
-                if '€' not in text and 'eur' not in text and '$' not in text:
-                    issues.append("Currency symbol not detected near price.")
+            checks = {
+                "Policies": False,
+                "Contact": False,
+                "Schema": False,
+                "Currency": False
+            }
 
-            return {"url": url, "issues": issues, "status": "Pass" if not issues else "Fail"}
-        except Exception as e:
-            return {"url": url, "issues": [f"Connection Error: {str(e)}"], "status": "Error"}
+            if is_main:
+                policies = ['refund', 'shipping', 'privacy', 'terms', 'impressum', 'widerruf', 'versand']
+                if any(p in text for p in policies): checks["Policies"] = True
+                else: issues.append("Missing Policies")
+                
+                if '@' in text: checks["Contact"] = True
+                else: issues.append("Missing Contact Info")
+            
+            if not is_main or '/products/' in url:
+                if any(s in text for s in ['"@type":"product"', '"@type": "product"']): checks["Schema"] = True
+                else: issues.append("Missing JSON-LD Schema")
+                
+                if any(c in text for c in ['€', 'eur', '$']): checks["Currency"] = True
+                else: issues.append("Missing Currency Symbol")
+
+            return {"url": url, "issues": issues, "checks": checks, "status": "Pass" if not issues else "Fail"}
+        except:
+            return {"url": url, "issues": ["Error"], "checks": {}, "status": "Error"}
 
     def full_audit(self):
-        try:
-            res = requests.get(self.base_url, headers=self.headers, timeout=10)
-            main_audit = self.audit_page(self.base_url, is_main=True)
-            product_links = self.get_links(res.text)
+        main_audit = self.audit_page(self.base_url, is_main=True)
+        product_links = self.get_links(requests.get(self.base_url, headers=self.headers).text)
+        product_audits = [self.audit_page(l) for l in product_links]
+        
+        score = max(0, 100 - (len(main_audit['issues']) * 10 + sum(len(p['issues']) for p in product_audits) * 5))
+        
+        result = {
+            "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "domain": self.domain,
+            "score": score,
+            "main_page": main_audit,
+            "products": product_audits
+        }
+        
+        # Log naar Webhook (voor Google Sheets)
+        if WEBHOOK_URL:
+            try: requests.post(WEBHOOK_URL, json=result, timeout=5)
+            except: pass
             
-            product_audits = []
-            for link in product_links:
-                product_audits.append(self.audit_page(link))
-            
-            total_issues = len(main_audit['issues']) + sum(len(p['issues']) for p in product_audits)
-            score = max(0, 100 - (total_issues * 7))
-            
-            return {
-                "main_page": main_audit,
-                "products": product_audits,
-                "score": score,
-                "domain": self.domain
-            }
-        except Exception as e:
-            return {"error": f"Failed to scan {self.base_url}: {str(e)}"}
+        return result
 
 @app.route('/')
 def index():
     return render_template_string('''
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
-    <meta charset="UTF-8">
-    <title>GMC Guardian | Professional Audit Tool</title>
+    <title>GMC Guardian | Sheets Integrated</title>
     <style>
-        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; max-width: 900px; margin: 40px auto; background: #f0f2f5; color: #1c1e21; }
-        .container { background: white; padding: 40px; border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.1); }
-        .header { text-align: center; margin-bottom: 30px; }
-        .input-group { display: flex; gap: 10px; justify-content: center; margin-bottom: 20px; }
-        input { flex: 1; padding: 12px; border: 2px solid #ddd; border-radius: 6px; font-size: 16px; }
-        button { padding: 12px 24px; background: #0052cc; color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; }
-        button:hover { background: #0041a3; }
-        .btn-pdf { background: #27ae60; margin-top: 20px; display: none; }
-        #results { margin-top: 30px; border-top: 1px solid #eee; padding-top: 20px; }
-        .score-circle { width: 100px; height: 100px; border-radius: 50%; background: #f8f9fa; display: flex; align-items: center; justify-content: center; font-size: 24px; font-weight: bold; margin: 0 auto 20px; border: 5px solid #0052cc; }
-        .issue-list { list-style: none; padding: 0; }
-        .issue-item { background: #fff5f5; border-left: 4px solid #c0392b; padding: 10px; margin-bottom: 8px; font-size: 14px; }
-        .success-msg { color: #27ae60; font-weight: bold; }
-        @media print { .no-print { display: none; } .container { box-shadow: none; border: none; } }
+        body { font-family: sans-serif; max-width: 800px; margin: 40px auto; background: #f4f7f6; }
+        .card { background: white; padding: 30px; border-radius: 10px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
+        input { width: 60%; padding: 12px; border: 1px solid #ddd; border-radius: 5px; }
+        button { padding: 12px 20px; background: #0052cc; color: white; border: none; border-radius: 5px; cursor: pointer; }
+        .result-row { border-bottom: 1px solid #eee; padding: 10px 0; }
+        .status-pass { color: green; font-weight: bold; }
+        .status-fail { color: red; font-weight: bold; }
     </style>
 </head>
 <body>
-    <div class="container" id="report-area">
-        <div class="header">
-            <h1>GMC Guardian Audit</h1>
-            <p>Deep-scan compliance report for Google Merchant Center</p>
-        </div>
-        
-        <div class="input-group no-print">
-            <input type="text" id="url-input" placeholder="https://mialea.de">
-            <button onclick="runAudit()">Analyze Store</button>
-        </div>
-
-        <div id="results"></div>
-        <center><button class="btn-pdf no-print" id="pdf-btn" onclick="window.print()">Download Report as PDF</button></center>
+    <div class="card">
+        <h1>GMC Audit & Sheets Logger</h1>
+        <p>Voer een URL in om een compliance check uit te voeren en op te slaan.</p>
+        <input type="text" id="url" placeholder="https://winkel.nl">
+        <button onclick="run()">Start & Log</button>
+        <div id="out"></div>
     </div>
-
     <script>
-        async function runAudit() {
-            const url = document.getElementById('url-input').value;
-            if(!url) return alert("Please enter a URL");
+        async function run() {
+            const url = document.getElementById('url').value;
+            const out = document.getElementById('out');
+            out.innerHTML = "Bezig met scannen en loggen naar spreadsheet...";
+            const res = await fetch('/audit?url=' + encodeURIComponent(url));
+            const data = await res.json();
             
-            const resDiv = document.getElementById('results');
-            const pdfBtn = document.getElementById('pdf-btn');
-            resDiv.innerHTML = "<center><p>🔍 Scanning main page and product deep-links... This may take 10-20 seconds.</p></center>";
-            pdfBtn.style.display = "none";
-
-            try {
-                const response = await fetch('/audit?url=' + encodeURIComponent(url));
-                const data = await response.json();
-                
-                if(data.error) {
-                    resDiv.innerHTML = `<p style="color:red">${data.error}</p>`;
-                    return;
-                }
-
-                let html = `<div class="score-circle">${data.score}%</div>`;
-                html += `<h2 style="text-align:center">Audit for ${data.domain}</h2>`;
-                
-                // Main Page
-                html += `<h3>Main Page Status: ${data.main_page.status}</h3>`;
-                if(data.main_page.issues.length > 0) {
-                    html += '<ul class="issue-list">' + data.main_page.issues.map(i => `<li class="issue-item">${i}</li>`).join('') + '</ul>';
-                } else {
-                    html += '<p class="success-msg">✅ Main page is fully compliant.</p>';
-                }
-
-                // Products
-                html += `<h3>Product Page Deep-Scan (${data.products.length} pages)</h3>`;
-                data.products.forEach(p => {
-                    html += `<div style="margin-top:15px;"><strong>Page:</strong> <small>${p.url}</small></div>`;
-                    if(p.issues.length > 0) {
-                        html += '<ul class="issue-list">' + p.issues.map(i => `<li class="issue-item">${i}</li>`).join('') + '</ul>';
-                    } else {
-                        html += '<p class="success-msg">✅ Product page compliant.</p>';
-                    }
-                });
-
-                resDiv.innerHTML = html;
-                pdfBtn.style.display = "block";
-            } catch (e) {
-                resDiv.innerHTML = "<p style='color:red'>Error connecting to scanner. Please try again.</p>";
-            }
+            let html = `<h2>Score: ${data.score}%</h2><p>Data is verzonden naar de spreadsheet log.</p>`;
+            html += `<h3>Hoofdpagina: <span class="status-${data.main_page.status.toLowerCase()}">${data.main_page.status}</span></h3>`;
+            data.products.forEach(p => {
+                html += `<div class="result-row"><strong>Product:</strong> ${p.url} - <span class="status-${p.status.toLowerCase()}">${p.status}</span></div>`;
+            });
+            out.innerHTML = html;
         }
     </script>
 </body>
@@ -182,7 +134,6 @@ def index():
 @app.route('/audit')
 def audit():
     url = request.args.get('url')
-    if not url: return jsonify({"error": "No URL provided"})
     scanner = GMCScanner(url)
     return jsonify(scanner.full_audit())
 
