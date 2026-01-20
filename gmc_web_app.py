@@ -1,59 +1,103 @@
+import os
+import json
+import re
+import datetime
+import logging
+import requests
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urljoin, urlparse
+from bs4 import BeautifulSoup
 from flask import Flask, request, jsonify, render_template_string
 from flask_cors import CORS
-import requests
-from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
-import json
-import datetime
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+# --- SENIOR CONFIGURATION ---
+DEBUG = True
+PORT = 5000
+WEBHOOK_URL = ""  # n8n/Zapier endpoint
+MAX_PRODUCT_PAGES = 5
+TIMEOUT = 12
+
+# Logging setup
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 CORS(app)
 
-# --- CONFIGURATIE ---
-WEBHOOK_URL = "" # Vul hier je n8n/Zapier URL in
-
-class GMCScanner:
+class GMCScannerEngine:
+    """Senior-grade scanning engine with concurrency and robust error handling."""
+    
     def __init__(self, base_url):
-        if not base_url.startswith(('http://', 'https://')):
-            base_url = 'https://' + base_url
-        self.base_url = base_url.strip('/')
+        self.base_url = self._normalize_url(base_url)
         self.domain = urlparse(self.base_url).netloc
-        self.headers = {'User-Agent': 'Mozilla/5.0 (GMC-Audit-Bot/3.0)'}
-        # Woorden die GMC vaak triggeren op 'Misrepresentation'
-        self.red_flags = ['guaranteed', 'miracle', '100% safe', 'no risk', 'best price in the world', 'free money', 'weight loss']
+        self.session = self._setup_session()
+        self.red_flags = [
+            r'guaranteed',
+            r'miracle',
+            r'100% safe',
+            r'no risk',
+            r'weight loss',
+            r'get rich',
+            r'\bfree money\b'
+        ]
 
-    def analyze_text_compliance(self, text):
-        found_flags = [flag for flag in self.red_flags if flag in text.lower()]
-        if not found_flags:
-            return "Compliant", "Geen verdachte teksten gevonden."
-        return "Risk", f"Verdachte termen gevonden: {', '.join(found_flags)}"
+    def _normalize_url(self, url):
+        url = url.strip().lower()
+        if not url.startswith(('http://', 'https://')):
+            url = 'https://' + url
+        return url.rstrip('/')
 
-    def get_links(self, html, limit=5):
-        soup = BeautifulSoup(html, 'html.parser')
-        links = set()
-        for a in soup.find_all('a', href=True):
-            url = urljoin(self.base_url, a['href'])
-            if self.domain in urlparse(url).netloc and ('/products/' in url or '/product/' in url):
-                links.add(url)
-            if len(links) >= limit: break
-        return list(links)
+    def _setup_session(self):
+        session = requests.Session()
+        retry = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount('http://', adapter)
+        session.mount('https://', adapter)
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept-Language': 'en-US,en;q=0.9,nl;q=0.8,de;q=0.7'
+        })
+        return session
+
+    def analyze_text(self, html_content):
+        text = BeautifulSoup(html_content, 'html.parser').get_text().lower()
+        found = [flag for flag in self.red_flags if re.search(flag, text)]
+        if found:
+            return "Risk", f"Suspicious terms: {', '.join(found)}"
+        return "Compliant", "No high-risk claims detected."
 
     def audit_page(self, url, is_main=False):
         try:
-            res = requests.get(url, headers=self.headers, timeout=10)
-            soup = BeautifulSoup(res.text, 'html.parser')
-            text = res.text.lower()
+            response = self.session.get(url, timeout=TIMEOUT)
+            response.raise_for_status()
+            html = response.text
+            text_lower = html.lower()
             
             issues = []
-            verdict, reason = self.analyze_text_compliance(res.text)
+            verdict, reason = self.analyze_text(html)
             
             if is_main:
-                policies = ['refund', 'shipping', 'privacy', 'terms', 'impressum', 'widerruf', 'versand']
-                if not any(p in text for p in policies): issues.append("Missing Policies")
-                if '@' not in text: issues.append("Missing Contact Info")
+                # Policy keywords (Multi-language support)
+                policies = {
+                    'Refund': ['refund', 'rückgabe', 'widerruf', 'retour'],
+                    'Shipping': ['shipping', 'versand', 'levering'],
+                    'Privacy': ['privacy', 'datenschutz', 'privacybeleid'],
+                    'Terms': ['terms', 'agb', 'voorwaarden'],
+                    'Legal': ['impressum', 'legal notice', 'colofon']
+                }
+                for p, keys in policies.items():
+                    if not any(k in text_lower for k in keys):
+                        issues.append(f"Missing {p} Policy")
+                
+                if '@' not in text_lower: issues.append("No contact email found")
             else:
-                if not any(s in text for s in ['"@type":"product"', '"@type": "product"']): issues.append("Missing Schema")
-                if not any(c in text for c in ['€', 'eur', '$']): issues.append("Missing Currency")
+                # Technical Product Checks
+                if not any(s in text_lower for s in ['"@type":"product"', '"@type": "product"', 'schema.org/product']):
+                    issues.append("Missing JSON-LD Product Schema")
+                if not any(c in text_lower for c in ['€', 'eur', '$', '£']):
+                    issues.append("Currency symbol missing near price")
 
             if verdict == "Risk": issues.append(reason)
 
@@ -62,86 +106,155 @@ class GMCScanner:
                 "type": "Main" if is_main else "Product",
                 "status": "Pass" if not issues else "Fail",
                 "text_compliance": verdict,
-                "details": ", ".join(issues) if issues else "All checks passed"
+                "details": "; ".join(issues) if issues else "Compliant"
             }
-        except:
-            return {"url": url, "type": "Error", "status": "Error", "text_compliance": "N/A", "details": "Page unreachable"}
+        except Exception as e:
+            logger.error(f"Error auditing {url}: {e}")
+            return {"url": url, "type": "Error", "status": "Error", "text_compliance": "N/A", "details": f"Unreachable: {str(e)}"}
 
-    def full_audit(self):
-        main_page_data = self.audit_page(self.base_url, is_main=True)
-        
+    def get_product_links(self, html):
+        soup = BeautifulSoup(html, 'html.parser')
+        links = set()
+        for a in soup.find_all('a', href=True):
+            full_url = urljoin(self.base_url, a['href'])
+            if self.domain in urlparse(full_url).netloc and ('/products/' in full_url or '/product/' in full_url):
+                links.add(full_url)
+            if len(links) >= MAX_PRODUCT_PAGES: break
+        return list(links)
+
+    def run_full_audit(self):
+        logger.info(f"Starting full audit for {self.base_url}")
         try:
-            res = requests.get(self.base_url, headers=self.headers, timeout=10)
-            product_links = self.get_links(res.text)
-        except: product_links = []
+            main_res = self.session.get(self.base_url, timeout=TIMEOUT)
+            main_data = self.audit_page(self.base_url, is_main=True)
+            product_links = self.get_product_links(main_res.text)
+            
+            # Parallel execution for speed
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                product_results = list(executor.map(self.audit_page, product_links))
+            
+            all_rows = [main_data] + product_results
+            score = self._calculate_score(all_rows)
+            
+            self._log_to_webhook(all_rows)
+            
+            return {
+                "domain": self.domain,
+                "score": score,
+                "rows": all_rows,
+                "timestamp": datetime.datetime.now().isoformat()
+            }
+        except Exception as e:
+            return {"error": f"Critical failure: {str(e)}"}
 
-        all_rows = [main_page_data]
-        for link in product_links:
-            all_rows.append(self.audit_page(link))
+    def _calculate_score(self, rows):
+        if not rows: return 0
+        fail_count = sum(1 for r in rows if r['status'] == "Fail")
+        return max(0, 100 - (fail_count * 12))
 
-        # Verstuur elke rij apart naar de webhook voor Google Sheets
-        if WEBHOOK_URL:
-            for row in all_rows:
-                payload = {
-                    "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "domain": self.domain,
-                    **row
-                }
-                try: requests.post(WEBHOOK_URL, json=payload, timeout=2)
-                except: pass
+    def _log_to_webhook(self, rows):
+        if not WEBHOOK_URL: return
+        for row in rows:
+            payload = {"domain": self.domain, "timestamp": datetime.datetime.now().isoformat(), **row}
+            try: requests.post(WEBHOOK_URL, json=payload, timeout=3)
+            except: pass
 
-        return {"domain": self.domain, "rows": all_rows, "score": self.calculate_score(all_rows)}
-
-    def calculate_score(self, rows):
-        fails = sum(1 for r in rows if r['status'] == "Fail")
-        return max(0, 100 - (fails * 15))
+# --- FLASK ROUTES ---
 
 @app.route('/')
 def index():
     return render_template_string('''
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>GMC Guardian | Deep Sheets Logger</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GMC Guardian | Enterprise Audit</title>
+    <script src="https://cdn.tailwindcss.com"></script>
     <style>
-        body { font-family: sans-serif; max-width: 1000px; margin: 40px auto; background: #f0f4f8; }
-        .card { background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); }
-        table { width: 100%; border-collapse: collapse; margin-top: 20px; }
-        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
-        th { background: #0052cc; color: white; }
-        .status-pass { color: #27ae60; font-weight: bold; }
-        .status-fail { color: #c0392b; font-weight: bold; }
-        .btn { padding: 12px 20px; background: #0052cc; color: white; border: none; border-radius: 5px; cursor: pointer; }
+        @media print { .no-print { display: none; } }
     </style>
 </head>
-<body>
-    <div class="card">
-        <h1>GMC Deep Audit & Sheets Logger</h1>
-        <p>Elke pagina wordt als een aparte rij gelogd in de spreadsheet.</p>
-        <input type="text" id="url" style="width:60%; padding:10px;" placeholder="https://winkel.nl">
-        <button class="btn" onclick="run()">Start Deep Scan</button>
-        <div id="out"></div>
+<body class="bg-slate-50 text-slate-900">
+    <div class="max-w-5xl mx-auto py-12 px-4">
+        <div class="bg-white rounded-2xl shadow-xl p-8">
+            <div class="text-center mb-10">
+                <h1 class="text-4xl font-extrabold text-indigo-600 mb-2">GMC Guardian</h1>
+                <p class="text-slate-500">Enterprise-grade Google Merchant Center Compliance Auditor</p>
+            </div>
+
+            <div class="flex gap-4 mb-8 no-print">
+                <input type="text" id="urlInput" placeholder="https://store-url.com" class="flex-1 p-4 border-2 border-slate-200 rounded-xl focus:border-indigo-500 outline-none transition">
+                <button onclick="startAudit()" id="btn" class="bg-indigo-600 text-white px-8 py-4 rounded-xl font-bold hover:bg-indigo-700 transition">Run Deep Audit</button>
+            </div>
+
+            <div id="loader" class="hidden text-center py-10">
+                <div class="animate-spin rounded-full h-12 w-12 border-b-2 border-indigo-600 mx-auto mb-4"></div>
+                <p class="text-slate-600">Analyzing domain and product deep-links...</p>
+            </div>
+
+            <div id="results" class="hidden">
+                <div class="flex items-center justify-between mb-6">
+                    <h2 class="text-2xl font-bold" id="domainTitle"></h2>
+                    <div class="text-3xl font-black text-indigo-600" id="scoreVal"></div>
+                </div>
+                
+                <div class="overflow-x-auto">
+                    <table class="w-full text-left border-collapse">
+                        <thead>
+                            <tr class="bg-slate-100">
+                                <th class="p-4 rounded-l-lg">Type</th>
+                                <th class="p-4">URL</th>
+                                <th class="p-4">Status</th>
+                                <th class="p-4">Text Check</th>
+                                <th class="p-4 rounded-r-lg">Details</th>
+                            </tr>
+                        </thead>
+                        <tbody id="tableBody"></tbody>
+                    </table>
+                </div>
+                
+                <div class="mt-8 flex justify-center no-print">
+                    <button onclick="window.print()" class="bg-emerald-600 text-white px-6 py-3 rounded-lg font-semibold hover:bg-emerald-700 transition">Download PDF Report</button>
+                </div>
+            </div>
+        </div>
     </div>
+
     <script>
-        async function run() {
-            const out = document.getElementById('out');
-            out.innerHTML = "<p>🔍 Bezig met diepe scan van alle pagina's en tekst-analyse...</p>";
-            const res = await fetch('/audit?url=' + encodeURIComponent(document.getElementById('url').value));
-            const data = await res.json();
+        async function startAudit() {
+            const url = document.getElementById('urlInput').value;
+            if(!url) return;
             
-            let html = `<h2>Eindscore: ${data.score}%</h2>`;
-            html += `<table><tr><th>Type</th><th>URL</th><th>Status</th><th>Tekst Check</th><th>Details</th></tr>`;
-            data.rows.forEach(r => {
-                html += `<tr>
-                    <td>${r.type}</td>
-                    <td><small>${r.url}</small></td>
-                    <td class="status-${r.status.toLowerCase()}">${r.status}</td>
-                    <td>${r.text_compliance}</td>
-                    <td><small>${r.details}</small></td>
-                </tr>`;
-            });
-            html += `</table>`;
-            out.innerHTML = html;
+            document.getElementById('loader').classList.remove('hidden');
+            document.getElementById('results').classList.add('hidden');
+            document.getElementById('btn').disabled = true;
+
+            try {
+                const res = await fetch('/audit?url=' + encodeURIComponent(url));
+                const data = await res.json();
+                
+                document.getElementById('domainTitle').innerText = "Report for " + data.domain;
+                document.getElementById('scoreVal').innerText = data.score + "%";
+                
+                const body = document.getElementById('tableBody');
+                body.innerHTML = data.rows.map(r => `
+                    <tr class="border-b border-slate-100 hover:bg-slate-50 transition">
+                        <td class="p-4 font-semibold">${r.type}</td>
+                        <td class="p-4 text-xs text-slate-500">${r.url}</td>
+                        <td class="p-4"><span class="px-3 py-1 rounded-full text-xs font-bold ${r.status === 'Pass' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}">${r.status}</span></td>
+                        <td class="p-4 text-sm">${r.text_compliance}</td>
+                        <td class="p-4 text-xs text-slate-600">${r.details}</td>
+                    </tr>
+                `).join('');
+
+                document.getElementById('results').classList.remove('hidden');
+            } catch (e) {
+                alert("Audit failed. Check console for details.");
+            } finally {
+                document.getElementById('loader').classList.add('hidden');
+                document.getElementById('btn').disabled = false;
+            }
         }
     </script>
 </body>
@@ -151,8 +264,9 @@ def index():
 @app.route('/audit')
 def audit():
     url = request.args.get('url')
-    scanner = GMCScanner(url)
-    return jsonify(scanner.full_audit())
+    if not url: return jsonify({"error": "URL required"}), 400
+    engine = GMCScannerEngine(url)
+    return jsonify(engine.run_full_audit())
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    app.run(host='0.0.0.0', port=PORT, debug=DEBUG)
